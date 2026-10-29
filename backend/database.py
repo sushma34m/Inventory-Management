@@ -23,6 +23,7 @@ def initialize_database():
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 batch_id TEXT UNIQUE NOT NULL,
+                product_code TEXT,
                 product_name TEXT NOT NULL,
                 branch TEXT NOT NULL,
                 quantity INTEGER NOT NULL CHECK (quantity >= 0),
@@ -31,6 +32,15 @@ def initialize_database():
                 selling_price REAL NOT NULL CHECK (selling_price >= 0)
             )
         """)
+
+        # Safely migrate older databases without deleting existing inventory.
+        inventory_columns = {
+            row["name"] for row in connection.execute(
+                "PRAGMA table_info(inventory)"
+            ).fetchall()
+        }
+        if "product_code" not in inventory_columns:
+            connection.execute("ALTER TABLE inventory ADD COLUMN product_code TEXT")
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS sales (
@@ -60,17 +70,17 @@ def initialize_database():
 
 def add_inventory_item(
     batch_id, product_name, branch, quantity,
-    days_left, unit_cost, selling_price
+    days_left, unit_cost, selling_price, product_code=None
 ):
     with get_connection() as connection:
         connection.execute("""
             INSERT INTO inventory (
-                batch_id, product_name, branch, quantity,
+                batch_id, product_code, product_name, branch, quantity,
                 days_left, unit_cost, selling_price
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            batch_id, product_name, branch, quantity,
+            batch_id, product_code, product_name, branch, quantity,
             days_left, unit_cost, selling_price
         ))
 

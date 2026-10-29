@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from backend.simulation import run_monte_carlo
 from backend.database import (
     initialize_database,
     add_inventory_item,
@@ -35,6 +36,7 @@ USERS = {
 SAMPLE_INVENTORY = pd.DataFrame({
     "Batch ID": ["B1001", "B1002", "B1003", "B1004", "B1005",
                  "B1006", "B1007", "B1008", "B1009", "B1010"],
+    "Product Code": ["P001", "P002", "P001", "P003", "P004", "P005", "P006", "P007", "P008", "P009"],
     "Product": ["Biscuits 200g", "Bread", "Biscuits", "Yogurt",
                 "Juice", "Butter", "Cheese", "Cake", "Curd", "Snacks"],
     "Branch": ["Hampankatta", "Hampankatta", "Kadri", "Kadri", "Bejai",
@@ -82,19 +84,21 @@ def initialise_data():
             inventory_df = pd.DataFrame(db_inventory)
             inventory_df = inventory_df.rename(columns={
                 "batch_id": "Batch ID",
+                "product_code": "Product Code",
                 "product_name": "Product",
                 "branch": "Branch",
                 "quantity": "Quantity",
                 "days_left": "Days Left",
-                "unit_cost": "Unit Cost (â‚¹)",
-                "selling_price": "Selling Price (â‚¹)",
+                "unit_cost": "Unit Cost (₹)",
+                "selling_price": "Selling Price (₹)",
             })
 
+            if "Product Code" not in inventory_df.columns:
+                inventory_df["Product Code"] = ""
+            inventory_df["Product Code"] = inventory_df["Product Code"].fillna("")
             st.session_state.inventory = inventory_df[
-                [
-                    "Batch ID", "Product", "Branch", "Quantity",
-                    "Days Left", "Unit Cost (â‚¹)", "Selling Price (â‚¹)"
-                ]
+                ["Batch ID", "Product Code", "Product", "Branch", "Quantity",
+                 "Days Left", "Unit Cost (₹)", "Selling Price (₹)"]
             ]
         else:
             st.session_state.inventory = SAMPLE_INVENTORY.copy()
@@ -111,11 +115,13 @@ def initialise_data():
                 "units_sold": "Units Sold",
             })
 
+            sales_df["Product Code"] = ""
             st.session_state.sales = sales_df[
-                ["Date", "Product", "Branch", "Units Sold"]
+                ["Date", "Product", "Product Code", "Branch", "Units Sold"]
             ]
         else:
             st.session_state.sales = SAMPLE_SALES.copy()
+        st.session_state.sales["Product Code"] = ""
 
     if "transfer_requests" not in st.session_state:
         st.session_state.transfer_requests = get_all_transfer_requests()
@@ -229,7 +235,7 @@ def get_recommendations(inventory, sales):
         options = [
             {
                 "Action": "Keep",
-                "Destination": source,
+                "Destination": "",
                 "Estimated Units Sold": keep_units,
                 "Estimated Revenue (₹)": round(keep_units * price, 2),
                 "Estimated Unsold Units": quantity - keep_units,
@@ -241,7 +247,7 @@ def get_recommendations(inventory, sales):
             },
             {
                 "Action": "Markdown",
-                "Destination": source,
+                "Destination": "",
                 "Estimated Units Sold": markdown_units,
                 "Estimated Revenue (₹)": round(
                     markdown_units * price * 0.75, 2
@@ -414,8 +420,8 @@ def main():
         col2.metric("At-Risk Batches", len(at_risk))
         col3.metric("At-Risk Units", int(at_risk["Quantity"].sum()))
         col4.metric(
-            "Expiring in 3 Days",
-            int(inventory["Days Left"].between(0, 3).sum())
+            "Expiring in 30 Days",
+            int(inventory["Days Left"].between(0, 30).sum())
         )
 
         if role == "admin":
@@ -471,8 +477,9 @@ def main():
         st.subheader("Add New Batch")
 
         with st.form("add_batch_form"):
-            batch_id = st.text_input("Batch ID")
-            product = st.text_input("Product Name")
+            product_code = st.text_input("Product Code", placeholder="e.g., PROD001")
+            batch_id = st.text_input("Batch ID", placeholder="e.g., B1021")
+            product = st.text_input("Product Name", placeholder="e.g., Cookies")
 
             if role == "admin":
                 branch = st.selectbox("Branch", BRANCHES)
@@ -480,95 +487,106 @@ def main():
                 branch = assigned_branch
                 st.write(f"Branch: {assigned_branch}")
 
-            quantity = st.number_input(
-                "Quantity", min_value=1, value=10, step=1
-            )
-            days_left = st.number_input(
-                "Days Left", min_value=0, max_value=365, value=10, step=1
-            )
-            unit_cost = st.number_input(
-                "Unit Cost (₹)", min_value=0.0, value=10.0
-            )
-            selling_price = st.number_input(
-                "Selling Price (₹)", min_value=0.0, value=15.0
-            )
+            quantity = st.number_input("Quantity", min_value=1, value=10, step=1)
+            days_left = st.number_input("Days Left", min_value=0, max_value=365, value=10, step=1)
+            unit_cost = st.number_input("Unit Cost (₹)", min_value=0.0, value=10.0)
+            selling_price = st.number_input("Selling Price (₹)", min_value=0.0, value=15.0)
             add_batch = st.form_submit_button("Add Batch")
 
         if add_batch:
+            product_code = product_code.strip().upper()
             batch_id = batch_id.strip()
             product = product.strip()
 
-            if not batch_id or not product:
-                st.error("Enter both Batch ID and product name.")
-            elif batch_id in st.session_state.inventory["Batch ID"].astype(str).values:
-                st.error("That Batch ID already exists.")
+            if not product_code or not batch_id or not product:
+                st.error("Product Code, Batch ID, and Product Name are required.")
+            elif selling_price < 0 or unit_cost < 0:
+                st.error("Prices cannot be negative.")
             else:
-                new_batch = pd.DataFrame([{
-                    "Batch ID": batch_id,
-                    "Product": product,
-                    "Branch": branch,
-                    "Quantity": int(quantity),
-                    "Days Left": int(days_left),
-                    "Unit Cost (₹)": float(unit_cost),
-                    "Selling Price (₹)": float(selling_price),
-                }])
+                try:
+                    db_inventory = get_all_inventory()
+                    db_ids = {str(item["batch_id"]).strip().casefold() for item in db_inventory}
+                    session_ids = {str(value).strip().casefold() for value in st.session_state.inventory["Batch ID"]}
+                    if batch_id.casefold() in db_ids or batch_id.casefold() in session_ids:
+                        st.error("This Batch ID already exists. Every stock batch needs a unique Batch ID.")
+                    else:
+                        new_batch = pd.DataFrame([{
+                            "Batch ID": batch_id,
+                            "Product Code": product_code,
+                            "Product": product,
+                            "Branch": branch,
+                            "Quantity": int(quantity),
+                            "Days Left": int(days_left),
+                            "Unit Cost (₹)": float(unit_cost),
+                            "Selling Price (₹)": float(selling_price),
+                        }])
+                        add_inventory_item(
+                            batch_id=batch_id,
+                            product_code=product_code,
+                            product_name=product,
+                            branch=branch,
+                            quantity=int(quantity),
+                            days_left=int(days_left),
+                            unit_cost=float(unit_cost),
+                            selling_price=float(selling_price),
+                        )
+                        st.session_state.inventory = pd.concat(
+                            [st.session_state.inventory, new_batch], ignore_index=True
+                        )
+                        st.success("Batch added and saved successfully.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save the batch. Check database.py supports product_code. Details: {e}")
 
-            try:
-                    add_inventory_item(
-                        batch_id=batch_id,
-                        product_name=product,
-                        branch=branch,
-                        quantity=int(quantity),
-                        days_left=int(days_left),
-                        unit_cost=float(unit_cost),
-                        selling_price=float(selling_price),
-                    )
+        st.subheader("Sales History")
+        st.caption("Choose a Product Code so sales records consistently refer to the same product across branches and batches.")
 
-                    st.session_state.inventory = pd.concat(
-                        [st.session_state.inventory, new_batch],
-                        ignore_index=True
-                    )
-
-                    st.success("Batch added and saved to the database.")
-                    st.rerun()
-
-            except Exception as e:
-                    st.error(f"Could not save the batch: {e}")
-
-        st.subheader("Add Sales History")
-        st.caption(
-            "Add actual sales records to improve predictions. "
-            "Product names must match the inventory product name."
-        )
+        products = st.session_state.inventory[["Product Code", "Product"]].drop_duplicates().copy()
+        products["Product Code"] = products["Product Code"].fillna("").astype(str)
+        products = products[products["Product Code"].str.strip() != ""]
+        product_options = {
+            f"{row['Product Code']} — {row['Product']}": (row["Product Code"], row["Product"])
+            for _, row in products.iterrows()
+        }
 
         with st.form("sales_form"):
-            sale_date = st.date_input(
-                "Sales Date", value=pd.Timestamp.today().date()
-            )
-            sale_product = st.text_input("Sales Product Name")
-            sale_branch = st.selectbox("Sales Branch", BRANCHES)
-            units_sold = st.number_input(
-                "Units Sold", min_value=0, value=1, step=1
-            )
-            add_sale = st.form_submit_button("Add Sales Record")
-
-        if add_sale:
-            if not sale_product.strip():
-                st.error("Enter a product name.")
+            sale_date = st.date_input("Sales Date", value=pd.Timestamp.today().date())
+            if product_options:
+                selected_product_label = st.selectbox("Product Code / Product", list(product_options.keys()))
             else:
+                selected_product_label = None
+                st.warning("Add Product Codes to inventory before recording sales.")
+            sale_branch_options = [assigned_branch] if role == "manager" else BRANCHES
+            sale_branch = st.selectbox("Sales Branch", sale_branch_options)
+            units_sold = st.number_input("Units Sold", min_value=0, value=1, step=1)
+            add_sale = st.form_submit_button("Add Sales Record", disabled=not bool(product_options))
+
+        if add_sale and selected_product_label:
+            product_code, sale_product = product_options[selected_product_label]
+            try:
+                add_sales_record(
+                    product_name=sale_product,
+                    branch=sale_branch,
+                    sale_date=str(sale_date),
+                    units_sold=int(units_sold),
+                )
                 new_sale = pd.DataFrame([{
                     "Date": str(sale_date),
-                    "Product": sale_product.strip(),
+                    "Product Code": product_code,
+                    "Product": sale_product,
                     "Branch": sale_branch,
                     "Units Sold": int(units_sold),
                 }])
-
-                st.session_state.sales = pd.concat(
-                    [st.session_state.sales, new_sale],
-                    ignore_index=True
-                )
-                st.success("Sales record added.")
+                if "Product Code" not in st.session_state.sales.columns:
+                    st.session_state.sales["Product Code"] = ""
+                st.session_state.sales = pd.concat([st.session_state.sales, new_sale], ignore_index=True)
+                st.success("Sales record saved to the database.")
                 st.rerun()
+            except Exception as e:
+                st.error(f"Could not save sales record: {e}")
+
+        st.subheader("Recorded Sales")
+        st.dataframe(st.session_state.sales, use_container_width=True, hide_index=True)
 
     elif page == "Recovery Analysis":
         st.subheader("Batch-Wise Recovery Analysis")
