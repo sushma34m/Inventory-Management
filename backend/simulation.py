@@ -19,184 +19,241 @@ def run_monte_carlo(
     markdown_discount_rate=0.25,
     markdown_demand_uplift=0.25,
     simulations=1000,
-    seed=42
+    seed=42,
+    lambda_risk=0.75
 ):
-    """
-    Simulate uncertain daily demand, transport duration,
-    and transportation costs.
-
-    Returns average estimated recovery and the frequency
-    with which each action is recommended.
-
-    All outputs depend on the model assumptions supplied.
-    """
-
-    if quantity < 0 or selling_price < 0 or unit_cost < 0:
-        raise ValueError("Quantity and prices cannot be negative.")
-
-    if days_left < 0:
-        raise ValueError("Days left cannot be negative.")
-
-    if source_daily_demand < 0 or destination_daily_demand < 0:
-        raise ValueError("Daily demand cannot be negative.")
-
-    if distance_km < 0 or cost_per_km < 0 or handling_cost < 0:
-        raise ValueError("Transport costs and distance cannot be negative.")
-
-    if simulations < 1:
-        raise ValueError("Simulations must be at least 1.")
-
     rng = np.random.default_rng(seed)
 
     actions = [
+        "Keep",
         "Markdown",
         "Transportation",
         "Distributor Return"
     ]
 
-    recovery_values = {action: [] for action in actions}
-    recommendation_counts = {action: 0 for action in actions}
-    feasible_counts = {action: 0 for action in actions}
-    no_action_count = 0
+    recovery_values = {
+        action: [] for action in actions
+    }
+
+    expired_values = {
+        action: [] for action in actions
+    }
+
+    feasible_counts = {
+        action: 0 for action in actions
+    }
+
+    recommendation_counts = {
+        action: 0 for action in actions
+    }
 
     for _ in range(simulations):
 
-        # Random daily demand around the supplied average.
-        simulated_source_demand = int(
-            rng.poisson(source_daily_demand)
+        source_demand = max(
+            0,
+            int(rng.poisson(max(0, source_daily_demand)))
         )
 
-        simulated_destination_demand = int(
-            rng.poisson(destination_daily_demand)
+        destination_demand = max(
+            0,
+            int(rng.poisson(max(0, destination_daily_demand)))
         )
 
-        # Simulate a transport duration of 1, 2, or 3 days.
-        simulated_transport_days = int(
+        transport_days = int(
             rng.choice([1, 2, 3], p=[0.70, 0.20, 0.10])
         )
 
-        # Simulate transport rates with moderate variation.
-        simulated_cost_per_km = max(
-            0.0,
-            float(rng.normal(cost_per_km, cost_per_km * 0.10))
+        random_cost_per_km = max(
+            0,
+            rng.normal(cost_per_km, cost_per_km * 0.10)
         )
 
-        simulated_handling_cost = max(
-            0.0,
-            float(rng.normal(
-                handling_cost,
-                max(1.0, handling_cost * 0.10)
-            ))
+        random_handling_cost = max(
+            0,
+            rng.normal(handling_cost, handling_cost * 0.10)
         )
 
-        results = compare_recovery_actions(
+        keep_units = min(
+            quantity,
+            source_demand * days_left
+        )
+
+        keep_recovery = keep_units * selling_price
+
+        recovery_values["Keep"].append(keep_recovery)
+
+        expired_values["Keep"].append(
+            quantity - keep_units
+        )
+
+        if keep_recovery > 0:
+            feasible_counts["Keep"] += 1
+
+        report = compare_recovery_actions(
             quantity=quantity,
             selling_price=selling_price,
             unit_cost=unit_cost,
             days_left=days_left,
-            source_daily_demand=simulated_source_demand,
-            destination_daily_demand=simulated_destination_demand,
+            source_daily_demand=source_demand,
+            destination_daily_demand=destination_demand,
             distance_km=distance_km,
-            cost_per_km=simulated_cost_per_km,
-            handling_cost=simulated_handling_cost,
-            transport_days=simulated_transport_days,
+            cost_per_km=random_cost_per_km,
+            handling_cost=random_handling_cost,
             return_accepted=return_accepted,
             return_recovery_rate=return_recovery_rate,
             markdown_discount_rate=markdown_discount_rate,
-            markdown_demand_uplift=markdown_demand_uplift
+            markdown_demand_uplift=markdown_demand_uplift,
+            transport_days=transport_days
         )
 
-        for result in results["options"]:
-            action = result["action"]
+        scenario_recoveries = {
+            "Keep": keep_recovery
+        }
 
-            if result["feasible"]:
-                feasible_counts[action] += 1
-                recovery_values[action].append(
-                    result["estimated_recovery"]
+        for option in report["options"]:
+
+            action = option["action"]
+
+            recovery = (
+                option["estimated_recovery"]
+                if option["feasible"]
+                else 0.0
+            )
+
+            recovery_values[action].append(recovery)
+
+            if action == "Distributor Return":
+                expired = (
+                    0 if option["feasible"] else quantity
                 )
+            else:
+                sold_units = option.get(
+                    "estimated_units_sold", 0
+                )
+                expired = quantity - sold_units
 
-        if results["recommended_action"] is None:
-            no_action_count += 1
-        else:
-            recommendation_counts[
-                results["recommended_action"]
-            ] += 1
+            expired_values[action].append(
+                max(0, expired)
+            )
 
-    summary = {}
+            if option["feasible"]:
+                feasible_counts[action] += 1
+
+            scenario_recoveries[action] = recovery
+
+        positive_actions = {
+            action: recovery
+            for action, recovery in scenario_recoveries.items()
+            if recovery > 0
+        }
+
+        if positive_actions:
+            scenario_best = max(
+                positive_actions,
+                key=positive_actions.get
+            )
+
+            recommendation_counts[scenario_best] += 1
+
+    results = {}
 
     for action in actions:
-        values = recovery_values[action]
 
-        summary[action] = {
-            "average_recovery_when_feasible": (
-                round(float(np.mean(values)), 2)
-                if values else None
+        recoveries = np.array(
+            recovery_values[action],
+            dtype=float
+        )
+
+        expired = np.array(
+            expired_values[action],
+            dtype=float
+        )
+
+        average_recovery = float(
+            np.mean(recoveries)
+        )
+
+        downside_std = float(
+            np.std(recoveries)
+        )
+
+        risk_score = (
+            average_recovery
+            - lambda_risk * downside_std
+        )
+
+        sorted_recoveries = np.sort(recoveries)
+
+        lower_count = max(
+            1,
+            int(np.ceil(simulations * 0.10))
+        )
+
+        cvar_10 = float(
+            np.mean(sorted_recoveries[:lower_count])
+        )
+
+        results[action] = {
+            "average_recovery": round(
+                average_recovery, 2
             ),
-            "feasible_scenarios": feasible_counts[action],
+            "risk_score": round(
+                risk_score, 2
+            ),
+            "downside_risk": round(
+                downside_std, 2
+            ),
+            "cvar_10": round(
+                cvar_10, 2
+            ),
+            "worst_case_recovery": round(
+                float(np.min(recoveries)), 2
+            ),
+            "expected_expired_units": round(
+                float(np.mean(expired)), 2
+            ),
             "feasibility_rate_percent": round(
-                feasible_counts[action] / simulations * 100, 2
+                feasible_counts[action]
+                / simulations * 100,
+                2
             ),
-            "recommendation_count": recommendation_counts[action],
+            "recommendation_count": (
+                recommendation_counts[action]
+            ),
             "recommendation_rate_percent": round(
-                recommendation_counts[action] / simulations * 100, 2
+                recommendation_counts[action]
+                / simulations * 100,
+                2
             )
         }
 
-    # Most frequently recommended action across the simulations.
-    best_action = (
-        max(recommendation_counts, key=recommendation_counts.get)
-        if sum(recommendation_counts.values()) > 0
-        else None
-    )
+    feasible_actions = [
+        action
+        for action in actions
+        if results[action]["feasibility_rate_percent"] > 0
+    ]
+
+    if feasible_actions:
+
+        best_action = max(
+            feasible_actions,
+            key=lambda action: results[action]["risk_score"]
+        )
+
+    else:
+        best_action = None
 
     return {
         "simulation_count": simulations,
-        "results": summary,
+        "results": results,
         "recommended_action": best_action,
-        "recommendation_count": recommendation_counts.get(best_action, 0)
-        if best_action else 0,
-        "no_feasible_action_scenarios": no_action_count,
-        "no_feasible_action_rate_percent": round(
-            no_action_count / simulations * 100, 2
+        "recommendation_count": (
+            recommendation_counts.get(best_action, 0)
+            if best_action else 0
+        ),
+        "no_feasible_actions": (
+            simulations
+            if not feasible_actions
+            else 0
         )
     }
-
-
-if __name__ == "__main__":
-    report = run_monte_carlo(
-        quantity=30,
-        selling_price=25,
-        unit_cost=18,
-        days_left=4,
-        source_daily_demand=3,
-        destination_daily_demand=8,
-        distance_km=5,
-        cost_per_km=12,
-        handling_cost=30,
-        simulations=1000,
-        seed=42
-    )
-
-    print("MONTE CARLO RECOVERY SIMULATION")
-    print("=" * 50)
-    print(f"Scenarios simulated: {report['simulation_count']}")
-
-    for action, values in report["results"].items():
-        print(f"\nAction: {action}")
-        print(
-            "Average recovery when feasible:",
-            values["average_recovery_when_feasible"]
-        )
-        print(
-            "Feasibility rate:",
-            f"{values['feasibility_rate_percent']}%"
-        )
-        print(
-            "Recommendation rate:",
-            f"{values['recommendation_rate_percent']}%"
-        )
-
-    print("\n" + "=" * 50)
-    print("Most frequently recommended:", report["recommended_action"])
-    print("Scenarios with no feasible action:",
-          report["no_feasible_action_scenarios"])

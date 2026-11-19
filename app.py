@@ -5,6 +5,7 @@ import numpy as np
 from backend.simulation import run_monte_carlo
 from backend.database import (
     initialize_database,
+    get_connection,
     add_inventory_item,
     get_all_inventory,
     get_inventory_by_branch,
@@ -12,6 +13,11 @@ from backend.database import (
     get_all_sales,
     create_transfer_request,
     get_all_transfer_requests,
+    approve_recovery_decision,
+    get_recovery_decisions,
+    get_notifications_for_branch,
+    get_all_notifications,
+    update_notification_status,
 )
 
 st.set_page_config(
@@ -22,7 +28,6 @@ st.set_page_config(
 
 BRANCHES = ["Hampankatta", "Kadri", "Bejai", "Kankanady", "Urwa"]
 
-# Demo login credentials
 USERS = {
     "admin": {"password": "Admin@123", "role": "admin", "branch": None},
     "manager1": {"password": "Branch@123", "role": "manager", "branch": "Hampankatta"},
@@ -32,7 +37,6 @@ USERS = {
     "manager5": {"password": "Branch@123", "role": "manager", "branch": "Urwa"},
 }
 
-# Sample inventory: demonstration data
 SAMPLE_INVENTORY = pd.DataFrame({
     "Batch ID": ["B1001", "B1002", "B1003", "B1004", "B1005",
                  "B1006", "B1007", "B1008", "B1009", "B1010"],
@@ -47,7 +51,6 @@ SAMPLE_INVENTORY = pd.DataFrame({
     "Selling Price (₹)": [15, 28, 15, 25, 22, 50, 75, 35, 18, 12],
 })
 
-# Sample sales records. Replace with actual store data when available.
 SAMPLE_SALES = pd.DataFrame([
     ["2026-10-15", "Biscuits 200g", "Hampankatta", 8],
     ["2026-10-16", "Biscuits 200g", "Hampankatta", 10],
@@ -77,50 +80,93 @@ SAMPLE_SALES = pd.DataFrame([
 def initialise_data():
     initialize_database()
 
-    if "inventory" not in st.session_state:
-        db_inventory = get_all_inventory()
+    if not st.session_state.get("inventory_migration_done", False):
+        with get_connection() as connection:
+            connection.execute("""
+                DELETE FROM inventory
+                WHERE batch_id = 'B1011'
+                   OR LOWER(product_name) = 'milk'
+            """)
 
-        if db_inventory:
-            inventory_df = pd.DataFrame(db_inventory)
-            inventory_df = inventory_df.rename(columns={
-                "batch_id": "Batch ID",
-                "product_code": "Product Code",
-                "product_name": "Product",
-                "branch": "Branch",
-                "quantity": "Quantity",
-                "days_left": "Days Left",
-                "unit_cost": "Unit Cost (₹)",
-                "selling_price": "Selling Price (₹)",
-            })
+        existing_items = get_all_inventory()
+        existing_ids = {
+            str(item["batch_id"]).strip().casefold()
+            for item in existing_items
+        }
 
-            if "Product Code" not in inventory_df.columns:
-                inventory_df["Product Code"] = ""
-            inventory_df["Product Code"] = inventory_df["Product Code"].fillna("")
-            st.session_state.inventory = inventory_df[
-                ["Batch ID", "Product Code", "Product", "Branch", "Quantity",
-                 "Days Left", "Unit Cost (₹)", "Selling Price (₹)"]
+        for _, item in SAMPLE_INVENTORY.iterrows():
+            batch_id = str(item["Batch ID"])
+
+            if batch_id.casefold() not in existing_ids:
+                add_inventory_item(
+                    batch_id=batch_id,
+                    product_code=item["Product Code"],
+                    product_name=item["Product"],
+                    branch=item["Branch"],
+                    quantity=int(item["Quantity"]),
+                    days_left=int(item["Days Left"]),
+                    unit_cost=float(item["Unit Cost (₹)"]),
+                    selling_price=float(item["Selling Price (₹)"])
+                )
+
+        st.session_state.pop("inventory", None)
+        st.session_state.inventory_migration_done = True
+
+    db_inventory = get_all_inventory()
+
+    if db_inventory:
+        inventory_df = pd.DataFrame(db_inventory)
+
+        inventory_df = inventory_df.rename(columns={
+            "batch_id": "Batch ID",
+            "product_code": "Product Code",
+            "product_name": "Product",
+            "branch": "Branch",
+            "quantity": "Quantity",
+            "days_left": "Days Left",
+            "unit_cost": "Unit Cost (₹)",
+            "selling_price": "Selling Price (₹)"
+        })
+
+        if "Product Code" not in inventory_df.columns:
+            inventory_df["Product Code"] = ""
+
+        inventory_df["Product Code"] = inventory_df["Product Code"].fillna("")
+
+        st.session_state.inventory = inventory_df[
+            [
+                "Batch ID",
+                "Product Code",
+                "Product",
+                "Branch",
+                "Quantity",
+                "Days Left",
+                "Unit Cost (₹)",
+                "Selling Price (₹)"
             ]
-        else:
-            st.session_state.inventory = SAMPLE_INVENTORY.copy()
+        ]
 
     if "sales" not in st.session_state:
         db_sales = get_all_sales()
 
         if db_sales:
             sales_df = pd.DataFrame(db_sales)
+
             sales_df = sales_df.rename(columns={
                 "sale_date": "Date",
                 "product_name": "Product",
                 "branch": "Branch",
-                "units_sold": "Units Sold",
+                "units_sold": "Units Sold"
             })
 
             sales_df["Product Code"] = ""
+
             st.session_state.sales = sales_df[
                 ["Date", "Product", "Product Code", "Branch", "Units Sold"]
             ]
         else:
             st.session_state.sales = SAMPLE_SALES.copy()
+
         st.session_state.sales["Product Code"] = ""
 
     if "transfer_requests" not in st.session_state:
@@ -128,8 +174,6 @@ def initialise_data():
 
 
 def estimate_daily_sales(product, branch, sales):
-    """Estimate daily sales using history or a clearly labelled fallback."""
-
     history = sales[
         (sales["Product"].astype(str).str.casefold() == str(product).casefold())
         & (sales["Branch"] == branch)
@@ -153,7 +197,6 @@ def estimate_daily_sales(product, branch, sales):
                 daily = recent.groupby("Date")["Units Sold"].sum().mean()
                 return max(0.0, float(daily)), "Branch sales history"
 
-    # Use the same product's history from other branches if available.
     other_branches = sales[
         sales["Product"].astype(str).str.casefold() == str(product).casefold()
     ].copy()
@@ -183,7 +226,6 @@ def estimate_daily_sales(product, branch, sales):
                 )
                 return max(0.0, float(per_branch.mean())), "Other-branch sales history"
 
-    # Illustrative fallback rates, not actual measured demand.
     product_name = str(product).casefold()
     fallback_rates = {
         "bread": 5.0,
@@ -217,111 +259,95 @@ def get_recommendations(inventory, sales):
         source = str(batch["Branch"])
         quantity = max(0, int(batch["Quantity"]))
         days_left = max(0, int(batch["Days Left"]))
-        cost = max(0.0, float(batch["Unit Cost (₹)"]))
-        price = max(0.0, float(batch["Selling Price (₹)"]))
+        unit_cost = max(0.0, float(batch["Unit Cost (₹)"]))
+        selling_price = max(
+            0.0, float(batch["Selling Price (₹)"])
+        )
 
-        daily_demand, prediction_source = estimate_daily_sales(
+        source_demand, demand_source = estimate_daily_sales(
             product, source, sales
         )
 
-        keep_units = min(
-            quantity, int(np.floor(daily_demand * days_left))
+        destination = None
+        destination_demand = 0.0
+
+        for branch in BRANCHES:
+            if branch == source:
+                continue
+
+            branch_sales = sales[
+                (sales["Product"] == product)
+                & (sales["Branch"] == branch)
+            ]
+
+            if branch_sales.empty:
+                continue
+
+            branch_demand, _ = estimate_daily_sales(
+                product, branch, sales
+            )
+
+            if branch_demand > destination_demand:
+                destination = branch
+                destination_demand = branch_demand
+
+        report = run_monte_carlo(
+            quantity=quantity,
+            selling_price=selling_price,
+            unit_cost=unit_cost,
+            days_left=days_left,
+            source_daily_demand=source_demand,
+            destination_daily_demand=destination_demand,
+            distance_km=5,
+            cost_per_km=12,
+            handling_cost=30,
+            simulations=1000,
+            seed=42
         )
 
-        markdown_units = min(
-            quantity, int(np.floor(daily_demand * 1.25 * days_left))
-        )
+        action_results = []
 
-        options = [
-            {
-                "Action": "Keep",
-                "Destination": "",
-                "Estimated Units Sold": keep_units,
-                "Estimated Revenue (₹)": round(keep_units * price, 2),
-                "Estimated Unsold Units": quantity - keep_units,
-                "Estimated Recovery Value (₹)": round(
-                    keep_units * price
-                    + (quantity - keep_units) * cost * 0.25, 2
-                ),
-                "Reason": "Estimated demand at the current branch before expiry.",
-            },
-            {
-                "Action": "Markdown",
-                "Destination": "",
-                "Estimated Units Sold": markdown_units,
-                "Estimated Revenue (₹)": round(
-                    markdown_units * price * 0.75, 2
-                ),
-                "Estimated Unsold Units": quantity - markdown_units,
-                "Estimated Recovery Value (₹)": round(
-                    markdown_units * price * 0.75
-                    + (quantity - markdown_units) * cost * 0.25, 2
-                ),
-                "Reason": "Assumes a 25% discount and a 25% demand uplift.",
-            },
-            {
-                "Action": "Return to Distributor",
-                "Destination": "Distributor",
-                "Estimated Units Sold": 0,
-                "Estimated Revenue (₹)": round(quantity * cost * 0.50, 2),
-                "Estimated Unsold Units": quantity,
-                "Estimated Recovery Value (₹)": round(
-                    quantity * cost * 0.50, 2
-                ),
-                "Reason": (
-                    "Assumes returns are accepted and 50% of unit cost "
-                    "is recovered. Verify supplier policy."
-                ),
-            },
-        ]
+        for action, values in report["results"].items():
+            if action == "Transportation" and (
+                destination is None or days_left <= 1
+            ):
+                continue
 
-        # Consider transfers only when matching product history exists there.
-        if days_left > 1:
-            for destination in BRANCHES:
-                if destination == source:
-                    continue
+            if values["feasibility_rate_percent"] <= 0:
+                continue
 
-                destination_history = sales[
-                    (sales["Product"].astype(str).str.casefold() == product.casefold())
-                    & (sales["Branch"] == destination)
-                ]
-
-                if destination_history.empty:
-                    continue
-
-                destination_daily, _ = estimate_daily_sales(
-                    product, destination, sales
+            action_results.append({
+                "action": action,
+                "destination": (
+                    destination if action == "Transportation" else ""
+                ),
+                "expected_recovery": values["average_recovery"],
+                "cvar_10": values["cvar_10"],
+                "risk_aware_score": values["risk_score"],
+                "expected_expired_units": values["expected_expired_units"],
+                "worst_case_recovery": values["worst_case_recovery"],
+                "expected_units_sold": max(
+                    0, quantity - values["expected_expired_units"]
                 )
+            })
 
-                transfer_units = min(
-                    quantity,
-                    int(np.floor(destination_daily * (days_left - 1)))
-                )
-
-                # Illustrative assumptions: one day of transport, ₹2 per unit.
-                transport_cost = quantity * 2
-                transfer_revenue = transfer_units * price - transport_cost
-
-                options.append({
-                    "Action": "Transfer",
-                    "Destination": destination,
-                    "Estimated Units Sold": transfer_units,
-                    "Estimated Revenue (₹)": round(transfer_revenue, 2),
-                    "Estimated Unsold Units": quantity - transfer_units,
-                    "Estimated Recovery Value (₹)": round(
-                        transfer_revenue
-                        + (quantity - transfer_units) * cost * 0.25, 2
-                    ),
-                    "Reason": (
-                        "Uses destination sales history; assumes one day "
-                        "for transport and ₹2 transport cost per unit."
-                    ),
-                })
+        if not action_results:
+            continue
 
         best = max(
-            options,
-            key=lambda option: option["Estimated Recovery Value (₹)"]
+            action_results,
+            key=lambda action: action["risk_aware_score"]
         )
+
+        for action in action_results:
+            action["Action"] = action["action"]
+            action["Destination"] = action["destination"]
+            action["Expected Recovery (₹)"] = action["expected_recovery"]
+            action["CVaR 10% (₹)"] = action["cvar_10"]
+            action["Risk-Aware Score (₹)"] = action["risk_aware_score"]
+            action["Expected Expired Units"] = action["expected_expired_units"]
+            action["Worst-Case Recovery (₹)"] = action["worst_case_recovery"]
+            action["Expected Units Sold"] = action["expected_units_sold"]
 
         results.append({
             "Batch ID": batch_id,
@@ -329,15 +355,24 @@ def get_recommendations(inventory, sales):
             "Source Branch": source,
             "Days Left": days_left,
             "Quantity": quantity,
-            "Predicted Daily Sales": round(daily_demand, 2),
-            "Prediction Source": prediction_source,
-            "Recommended Action": best["Action"],
-            "Destination": best["Destination"],
-            "Estimated Units Sold": best["Estimated Units Sold"],
-            "Estimated Revenue (₹)": best["Estimated Revenue (₹)"],
-            "Estimated Unsold Units": best["Estimated Unsold Units"],
-            "Estimated Recovery Value (₹)": best["Estimated Recovery Value (₹)"],
-            "Reason": best["Reason"],
+            "Predicted Daily Sales": round(source_demand, 2),
+            "Prediction Source": demand_source,
+            "Recommended Action": best["action"],
+            "Destination": best["destination"],
+            "Estimated Units Sold": round(best["expected_units_sold"]),
+            "Estimated Revenue (₹)": best["expected_recovery"],
+            "Estimated Unsold Units": round(best["expected_expired_units"]),
+            "Estimated Recovery Value (₹)": best["expected_recovery"],
+            "Expected Recovery (₹)": best["expected_recovery"],
+            "CVaR 10% (₹)": best["cvar_10"],
+            "Risk-Aware Score (₹)": best["risk_aware_score"],
+            "Expected Expired Units": best["expected_expired_units"],
+            "Worst-Case Recovery (₹)": best["worst_case_recovery"],
+            "Action Simulation Results": action_results,
+            "Reason": (
+                f"Selected {best['action']} using Monte Carlo "
+                f"risk-aware scoring. {demand_source}."
+            )
         })
 
     return pd.DataFrame(results)
@@ -384,10 +419,23 @@ def main():
     else:
         st.sidebar.write(f"Branch: **{assigned_branch}**")
 
-    page = st.sidebar.radio(
-        "Navigation",
-        ["Dashboard", "Inventory", "Recovery Analysis", "Transfer Requests"]
-    )
+    if role == "admin":
+        pages = [
+            "Dashboard",
+            "Inventory",
+            "Recovery Analysis",
+            "Admin Decision Center",
+            "Transfer Requests"
+        ]
+    else:
+        pages = [
+            "Dashboard",
+            "Inventory",
+            "My Notifications",
+            "Transfer Requests"
+        ]
+
+    page = st.sidebar.radio("Navigation", pages)
 
     if st.sidebar.button("Logout"):
         for key in ["logged_in", "username", "role", "branch"]:
@@ -539,7 +587,7 @@ def main():
                     st.error(f"Could not save the batch. Check database.py supports product_code. Details: {e}")
 
         st.subheader("Sales History")
-        st.caption("Choose a Product Code so sales records consistently refer to the same product across branches and batches.")
+        st.caption("Choose a Product Code so sales records consistently refer to the same product across branches.")
 
         products = st.session_state.inventory[["Product Code", "Product"]].drop_duplicates().copy()
         products["Product Code"] = products["Product Code"].fillna("").astype(str)
@@ -589,98 +637,657 @@ def main():
         st.dataframe(st.session_state.sales, use_container_width=True, hide_index=True)
 
     elif page == "Recovery Analysis":
-        st.subheader("Batch-Wise Recovery Analysis")
+        st.title("Recovery Analysis")
+        st.caption("Monte Carlo-Based Inventory Recovery Optimization")
 
-        st.warning(
-            "Demonstration estimates use fallback demand and assumptions "
-            "for markdown uplift, transport cost/time, and distributor refunds. "
-            "Verify actual policies before taking action."
+        recommendations = get_recommendations(
+            inventory,
+            sales
         )
 
-        recommendations = get_recommendations(inventory, sales)
-
         if recommendations.empty:
-            st.info(
-                "No batches are within the 30-day analysis window."
-            )
-        else:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Batches Analysed", len(recommendations))
-            col2.metric(
-                "Estimated Recovery Value",
-                f"₹{recommendations['Estimated Recovery Value (₹)'].sum():,.2f}"
-            )
-            col3.metric(
-                "Estimated Unsold Units",
-                int(recommendations["Estimated Unsold Units"].sum())
-            )
+            st.success("No near-expiry inventory found.")
 
-            st.subheader("Exact Batch Recommendations")
+        else:
+            st.subheader("Recovery Summary")
+
+            total_batches = len(recommendations)
+            total_quantity = recommendations["Quantity"].sum()
+            total_recovery = recommendations["Expected Recovery (₹)"].sum()
+            total_expired = recommendations["Expected Expired Units"].sum()
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric("At-Risk Batches", total_batches)
+            col2.metric("At-Risk Units", int(total_quantity))
+            col3.metric("Expected Recovery", f"₹{total_recovery:,.2f}")
+            col4.metric("Expected Expired Units", f"{total_expired:.2f}")
+
+            st.divider()
+
+            st.subheader("Recommended Recovery Actions")
+
+            display_columns = [
+                "Batch ID",
+                "Product",
+                "Source Branch",
+                "Days Left",
+                "Recommended Action",
+                "Destination",
+                "Expected Recovery (₹)",
+                "Risk-Aware Score (₹)",
+                "Expected Expired Units"
+            ]
+
             st.dataframe(
-                recommendations,
+                recommendations[display_columns],
                 use_container_width=True,
                 hide_index=True
             )
 
             st.download_button(
-                "Download Recommendations CSV",
-                data=recommendations.to_csv(index=False).encode("utf-8"),
-                file_name="recovery_recommendations.csv",
+                label="Download Recovery Report",
+                data=recommendations[display_columns].to_csv(index=False),
+                file_name="recovery_report.csv",
                 mime="text/csv"
             )
 
-            st.subheader("Batch-Wise Estimated Sold vs Unsold Units")
-            chart = recommendations[
-                ["Batch ID", "Product", "Estimated Units Sold", "Estimated Unsold Units"]
-            ].copy()
+            st.divider()
 
-            chart["Batch"] = (
-                chart["Batch ID"].astype(str) + " — " + chart["Product"]
-            )
-
-            st.bar_chart(
-                chart.set_index("Batch")[
-                    ["Estimated Units Sold", "Estimated Unsold Units"]
-                ]
-            )
-
-            st.subheader("What Should Happen to Each Batch?")
+            st.subheader("Monte Carlo Recovery Comparison")
 
             for _, row in recommendations.iterrows():
-                heading = (
-                    f"{row['Batch ID']} — {row['Product']} | "
-                    f"{row['Recommended Action']} → {row['Destination']}"
+
+                with st.expander(
+                    f"{row['Product']} | Batch {row['Batch ID']}"
+                ):
+
+                    st.write(f"**Source Branch:** {row['Source Branch']}")
+                    st.write(f"**Days Left:** {row['Days Left']}")
+                    st.write(
+                        f"**Recommended Action:** {row['Recommended Action']}"
+                    )
+
+                    if row["Destination"]:
+                        st.write(
+                            f"**Suggested Destination:** {row['Destination']}"
+                        )
+
+                    col1, col2, col3 = st.columns(3)
+
+                    col1.metric(
+                        "Expected Recovery",
+                        f"₹{row['Expected Recovery (₹)']:,.2f}"
+                    )
+
+                    col2.metric(
+                        "Risk-Aware Score",
+                        f"₹{row['Risk-Aware Score (₹)']:,.2f}"
+                    )
+
+                    col3.metric(
+                        "Expected Expired Units",
+                        f"{row['Expected Expired Units']:.2f}"
+                    )
+
+                    st.metric(
+                        "CVaR 10%",
+                        f"₹{row['CVaR 10% (₹)']:,.2f}"
+                    )
+
+                    st.metric(
+                        "Worst-Case Recovery",
+                        f"₹{row['Worst-Case Recovery (₹)']:,.2f}"
+                    )
+
+                    st.divider()
+
+                    action_df = pd.DataFrame(
+                        row["Action Simulation Results"]
+                    )
+
+                    comparison_columns = [
+                        "Action",
+                        "Destination",
+                        "Expected Recovery (₹)",
+                        "CVaR 10% (₹)",
+                        "Risk-Aware Score (₹)",
+                        "Expected Expired Units",
+                        "Worst-Case Recovery (₹)"
+                    ]
+
+                    st.dataframe(
+                        action_df[comparison_columns],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.bar_chart(
+                        action_df.set_index("Action")[
+                            "Risk-Aware Score (₹)"
+                        ]
+                    )
+
+                    st.info(row["Reason"])
+
+
+                    st.divider()
+
+                    st.subheader("What-If Scenario Analysis")
+
+                    st.caption(
+                        "Change business conditions and compare the new "
+                        "simulation with the original prediction."
+                    )
+
+                    batch_data = inventory[
+                        inventory["Batch ID"].astype(str) == str(row["Batch ID"])
+                    ].iloc[0]
+
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        demand_change = st.slider(
+                            "Daily Demand Change (%)",
+                            min_value=-50,
+                            max_value=100,
+                            value=0,
+                            step=5,
+                            key=f"demand_change_{row['Batch ID']}"
+                        )
+
+                        scenario_days = st.number_input(
+                            "Remaining Expiry Days",
+                            min_value=0,
+                            max_value=365,
+                            value=int(row["Days Left"]),
+                            step=1,
+                            key=f"scenario_days_{row['Batch ID']}"
+                        )
+
+                    with col2:
+                        transport_change = st.slider(
+                            "Transportation Cost Change (%)",
+                            min_value=-50,
+                            max_value=100,
+                            value=0,
+                            step=5,
+                            key=f"transport_change_{row['Batch ID']}"
+                        )
+
+                        st.metric(
+                            "Original Daily Demand",
+                            f"{row['Predicted Daily Sales']:.2f} units"
+                        )
+
+                    scenario_source_demand = max(
+                        0.0,
+                        float(row["Predicted Daily Sales"])
+                        * (1 + demand_change / 100)
+                    )
+
+                    destination_name = row["Destination"]
+
+                    if destination_name:
+                        scenario_destination_demand, _ = estimate_daily_sales(
+                            row["Product"],
+                            destination_name,
+                            sales
+                        )
+                    else:
+                        scenario_destination_demand = 0.0
+
+                    scenario_cost_per_km = max(
+                        0.0,
+                        12 * (1 + transport_change / 100)
+                    )
+
+                    st.write(
+                        f"**Scenario Daily Demand:** "
+                        f"{scenario_source_demand:.2f} units"
+                    )
+
+                    st.write(
+                        f"**Scenario Transportation Cost:** "
+                        f"₹{scenario_cost_per_km:.2f} per km"
+                    )
+
+                    if st.button(
+                        "Run What-If Simulation",
+                        key=f"run_what_if_{row['Batch ID']}",
+                        type="primary"
+                    ):
+
+                        original_report = run_monte_carlo(
+                            quantity=int(row["Quantity"]),
+                            selling_price=float(batch_data["Selling Price (₹)"]),
+                            unit_cost=float(batch_data["Unit Cost (₹)"]),
+                            days_left=int(row["Days Left"]),
+                            source_daily_demand=float(row["Predicted Daily Sales"]),
+                            destination_daily_demand=float(
+                                scenario_destination_demand
+                            ),
+                            distance_km=5,
+                            cost_per_km=12,
+                            handling_cost=30,
+                            simulations=1000,
+                            seed=42
+                        )
+
+                        scenario_report = run_monte_carlo(
+                            quantity=int(row["Quantity"]),
+                            selling_price=float(batch_data["Selling Price (₹)"]),
+                            unit_cost=float(batch_data["Unit Cost (₹)"]),
+                            days_left=int(scenario_days),
+                            source_daily_demand=float(scenario_source_demand),
+                            destination_daily_demand=float(
+                                scenario_destination_demand
+                            ),
+                            distance_km=5,
+                            cost_per_km=float(scenario_cost_per_km),
+                            handling_cost=30,
+                            simulations=1000,
+                            seed=42
+                        )
+
+                        st.subheader("Original vs What-If Results")
+
+                        original_action = original_report["recommended_action"]
+                        scenario_action = scenario_report["recommended_action"]
+
+                        result_columns = []
+
+                        for action in original_report["results"]:
+
+                            original_values = original_report["results"][action]
+                            scenario_values = scenario_report["results"][action]
+
+                            result_columns.append({
+                                "Action": action,
+                                "Original Recovery (₹)": original_values["average_recovery"],
+                                "What-If Recovery (₹)": scenario_values["average_recovery"],
+                                "Original Risk Score (₹)": original_values["risk_score"],
+                                "What-If Risk Score (₹)": scenario_values["risk_score"],
+                                "Original Expired Units": original_values["expected_expired_units"],
+                                "What-If Expired Units": scenario_values["expected_expired_units"]
+                            })
+
+                        comparison_df = pd.DataFrame(result_columns)
+
+                        st.dataframe(
+                            comparison_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.metric(
+                                "Original Recommendation",
+                                original_action or "No feasible action"
+                            )
+
+                        with col2:
+                            st.metric(
+                                "What-If Recommendation",
+                                scenario_action or "No feasible action"
+                            )
+
+                        if original_action == scenario_action:
+                            st.success(
+                                "The recommended action remains the same "
+                                "under the changed conditions."
+                            )
+                        else:
+                            st.warning(
+                                f"The recommendation changed from "
+                                f"{original_action} to {scenario_action}."
+                            )
+
+                        st.subheader("What-If Risk Score Comparison")
+
+                        chart_df = comparison_df.set_index("Action")[
+                            [
+                                "Original Risk Score (₹)",
+                                "What-If Risk Score (₹)"
+                            ]
+                        ]
+
+                        st.bar_chart(chart_df)
+
+                        st.caption(
+                            "Both results use 1,000 simulations and the same "
+                            "random seed. Scenario changes are temporary and "
+                            "do not modify inventory or sales records."
+                        )
+
+    elif page == "Admin Decision Center":
+        st.title("Admin Decision Center")
+        st.caption(
+            "Review Monte Carlo recommendations and approve the final recovery action."
+        )
+
+        if role != "admin":
+            st.error("Only the admin can approve recovery decisions.")
+            st.stop()
+
+        recommendations = get_recommendations(
+            all_inventory,
+            sales
+        )
+
+        if recommendations.empty:
+            st.success("No near-expiry inventory requires a decision.")
+
+        else:
+            st.subheader("Batches Awaiting Admin Decision")
+
+            for _, row in recommendations.iterrows():
+
+                batch_id = str(row["Batch ID"])
+                product = str(row["Product"])
+                source_branch = str(row["Source Branch"])
+
+                action_df = pd.DataFrame(
+                    row["Action Simulation Results"]
                 )
 
-                with st.expander(heading):
-                    st.write(f"**Source branch:** {row['Source Branch']}")
-                    st.write(f"**Days left:** {row['Days Left']}")
-                    st.write(
-                        f"**Predicted daily sales:** "
-                        f"{row['Predicted Daily Sales']} units/day"
-                    )
-                    st.write(
-                        f"**Prediction basis:** {row['Prediction Source']}"
-                    )
-                    st.write(
-                        f"**Recommended action:** {row['Recommended Action']}"
-                    )
-                    st.write(f"**Destination:** {row['Destination']}")
-                    st.write(
-                        f"**Estimated units sold:** {row['Estimated Units Sold']}"
-                    )
-                    st.write(
-                        f"**Estimated unsold units:** {row['Estimated Unsold Units']}"
-                    )
-                    st.write(
-                        f"**Estimated revenue:** ₹{row['Estimated Revenue (₹)']:,.2f}"
-                    )
-                    st.write(
-                        f"**Estimated recovery value:** "
-                        f"₹{row['Estimated Recovery Value (₹)']:,.2f}"
-                    )
-                    st.write(f"**Reason:** {row['Reason']}")
+                with st.expander(
+                    f"{product} | Batch {batch_id} | {source_branch}"
+                ):
 
+                    st.write(f"**Product:** {product}")
+                    st.write(f"**Batch ID:** {batch_id}")
+                    st.write(f"**Source Branch:** {source_branch}")
+                    st.write(f"**Available Quantity:** {row['Quantity']}")
+                    st.write(f"**Days Until Expiry:** {row['Days Left']}")
+
+                    st.subheader("Monte Carlo Comparison")
+
+                    comparison_columns = [
+                        "Action",
+                        "Destination",
+                        "Expected Recovery (₹)",
+                        "CVaR 10% (₹)",
+                        "Risk-Aware Score (₹)",
+                        "Expected Expired Units",
+                        "Worst-Case Recovery (₹)"
+                    ]
+
+                    st.dataframe(
+                        action_df[comparison_columns],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.bar_chart(
+                        action_df.set_index("Action")[
+                            "Risk-Aware Score (₹)"
+                        ]
+                    )
+
+                    recommended_action = row["Recommended Action"]
+
+                    st.success(
+                        f"Monte Carlo recommends: {recommended_action}"
+                    )
+
+                    action_options = action_df["Action"].tolist()
+
+                    selected_action = st.selectbox(
+                        "Admin: Select Final Recovery Action",
+                        action_options,
+                        index=action_options.index(recommended_action),
+                        key=f"admin_action_{batch_id}"
+                    )
+
+                    selected_result = action_df[
+                        action_df["Action"] == selected_action
+                    ].iloc[0]
+
+                    destination_branch = None
+
+                    if selected_action == "Transportation":
+
+                        destination_options = [
+                            branch for branch in BRANCHES
+                            if branch != source_branch
+                        ]
+
+                        suggested_destination = str(
+                            selected_result["Destination"]
+                        )
+
+                        if suggested_destination not in destination_options:
+                            suggested_destination = destination_options[0]
+
+                        destination_branch = st.selectbox(
+                            "Select Destination Branch",
+                            destination_options,
+                            index=destination_options.index(
+                                suggested_destination
+                            ),
+                            key=f"admin_destination_{batch_id}"
+                        )
+
+                    batch_inventory = all_inventory[
+                        all_inventory["Batch ID"].astype(str) == batch_id
+                    ]
+
+                    if batch_inventory.empty:
+                        st.error("Batch not found in inventory.")
+                        continue
+
+                    batch_data = batch_inventory.iloc[0]
+
+                    original_price = float(
+                        batch_data["Selling Price (₹)"]
+                    )
+
+                    if selected_action == "Markdown":
+                        final_selling_price = round(
+                            original_price * 0.75, 2
+                        )
+
+                    elif selected_action == "Keep":
+                        final_selling_price = original_price
+
+                    else:
+                        final_selling_price = None
+
+                    if final_selling_price is not None:
+                        st.metric(
+                            "Selling Price",
+                            f"₹{final_selling_price:.2f}"
+                        )
+
+                    st.metric(
+                        "Expected Recovery",
+                        f"₹{selected_result['Expected Recovery (₹)']:,.2f}"
+                    )
+
+                    st.metric(
+                        "Risk-Aware Score",
+                        f"₹{selected_result['Risk-Aware Score (₹)']:,.2f}"
+                    )
+
+                    st.metric(
+                        "Expected Expired Units",
+                        f"{selected_result['Expected Expired Units']:.2f}"
+                    )
+
+                    st.warning(
+                        "Approving this decision will permanently save it "
+                        "and send notifications to the relevant branch managers."
+                    )
+
+                    if st.button(
+                        "Approve Final Decision",
+                        key=f"approve_decision_{batch_id}",
+                        type="primary"
+                    ):
+
+                        try:
+                            decision_id = approve_recovery_decision(
+                                batch_id=batch_id,
+                                product_name=product,
+                                source_branch=source_branch,
+                                destination_branch=destination_branch,
+                                quantity=int(row["Quantity"]),
+                                action=selected_action,
+                                selling_price=final_selling_price,
+                                expected_recovery=float(
+                                    selected_result["Expected Recovery (₹)"]
+                                ),
+                                risk_score=float(
+                                    selected_result["Risk-Aware Score (₹)"]
+                                ),
+                                cvar_10=float(
+                                    selected_result["CVaR 10% (₹)"]
+                                ),
+                                expected_expired_units=float(
+                                    selected_result["Expected Expired Units"]
+                                ),
+                                admin_username=username
+                            )
+
+                            st.success(
+                                f"Decision #{decision_id} approved successfully. "
+                                "Branch notifications have been created."
+                            )
+
+                            st.rerun()
+
+                        except Exception as error:
+                            st.error(
+                                f"Could not approve decision: {error}"
+                            )
+
+            st.divider()
+
+        st.subheader("Approved Decision History")
+
+        decisions = get_recovery_decisions()
+
+        if decisions:
+            st.dataframe(
+                pd.DataFrame(decisions),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No approved recovery decisions yet.")
+
+            st.divider()
+
+        st.subheader("Branch Notification Tracking")
+
+        notifications = get_all_notifications()
+
+        if notifications:
+            notification_df = pd.DataFrame(notifications)
+
+            display_columns = [
+                "decision_id",
+                "batch_id",
+                "target_branch",
+                "notification_type",
+                "message",
+                "status",
+                "created_at",
+                "updated_at"
+            ]
+
+            notification_df = notification_df[display_columns]
+
+            notification_df = notification_df.rename(columns={
+                "decision_id": "Decision ID",
+                "batch_id": "Batch ID",
+                "target_branch": "Branch",
+                "notification_type": "Notification Type",
+                "message": "Instruction",
+                "status": "Manager Status",
+                "created_at": "Sent At",
+                "updated_at": "Last Updated"
+            })
+
+            st.dataframe(
+                notification_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader("Notification Status Summary")
+
+            status_counts = notification_df[
+                "Manager Status"
+            ].value_counts()
+
+            st.bar_chart(status_counts)
+
+        else:
+            st.info("No branch notifications available.")
+
+    elif page == "My Notifications":
+        st.title("My Notifications")
+        st.caption(f"Messages for {assigned_branch} Branch")
+
+        notifications = get_notifications_for_branch(assigned_branch)
+
+        if not notifications:
+            st.info("No notifications received yet.")
+
+        else:
+            for notification in notifications:
+                with st.container(border=True):
+                    st.subheader(
+                        f"Notification #{notification['id']}"
+                    )
+
+                    st.write(
+                        f"**Product Batch:** {notification['batch_id']}"
+                    )
+
+                    st.write(
+                        f"**Type:** {notification['notification_type']}"
+                    )
+
+                    st.write(
+                        f"**Message:** {notification['message']}"
+                    )
+
+                    st.write(
+                        f"**Current Status:** {notification['status']}"
+                    )
+
+                    statuses = [
+                        "Pending",
+                        "Accepted",
+                        "In Progress",
+                        "Completed",
+                        "Rejected"
+                    ]
+
+                    selected_status = st.selectbox(
+                        "Update Status",
+                        statuses,
+                        index=statuses.index(notification["status"]),
+                        key=f"notification_status_{notification['id']}"
+                    )
+
+                    if st.button(
+                        "Update Status",
+                        key=f"update_notification_{notification['id']}"
+                    ):
+                        update_notification_status(
+                            notification["id"],
+                            selected_status
+                        )
+
+                        st.success("Notification status updated.")
+                        st.rerun()
+    
     elif page == "Transfer Requests":
         st.subheader("Inter-Branch Transfer Requests")
 
