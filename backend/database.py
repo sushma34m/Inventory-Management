@@ -1,16 +1,26 @@
 
 import sqlite3
 from pathlib import Path
+from contextlib import contextmanager
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BASE_DIR / "inventory.db"
 
 
+@contextmanager
 def get_connection():
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def initialize_database():
@@ -29,17 +39,6 @@ def initialize_database():
                 selling_price REAL NOT NULL CHECK (selling_price >= 0)
             )
         """)
-
-        inventory_columns = {
-            row["name"] for row in connection.execute(
-                "PRAGMA table_info(inventory)"
-            ).fetchall()
-        }
-
-        if "product_code" not in inventory_columns:
-            connection.execute(
-                "ALTER TABLE inventory ADD COLUMN product_code TEXT"
-            )
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS sales (
@@ -127,6 +126,72 @@ def initialize_database():
             )
         """)
 
+        # Migrate older inventory databases.
+        inventory_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(inventory)"
+            ).fetchall()
+        }
+
+        if "product_code" not in inventory_columns:
+            connection.execute(
+                "ALTER TABLE inventory ADD COLUMN product_code TEXT"
+            )
+
+        # Migrate older recovery decision databases.
+        recovery_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(recovery_decisions)"
+            ).fetchall()
+        }
+
+        recovery_migrations = {
+            "destination_branch": "TEXT",
+            "selling_price": "REAL",
+            "expected_recovery": "REAL DEFAULT 0",
+            "risk_score": "REAL DEFAULT 0",
+            "cvar_10": "REAL DEFAULT 0",
+            "expected_expired_units": "REAL DEFAULT 0",
+            "admin_username": "TEXT",
+            "status": "TEXT NOT NULL DEFAULT 'Approved'",
+            "created_at": "TEXT"
+        }
+
+        for column, definition in recovery_migrations.items():
+            if column not in recovery_columns:
+                connection.execute(
+                    f"ALTER TABLE recovery_decisions "
+                    f"ADD COLUMN {column} {definition}"
+                )
+
+        # Migrate older notification databases.
+        notification_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(notifications)"
+            ).fetchall()
+        }
+
+        notification_migrations = {
+            "decision_id": "INTEGER",
+            "batch_id": "TEXT",
+            "target_branch": "TEXT",
+            "notification_type": "TEXT",
+            "message": "TEXT",
+            "status": "TEXT DEFAULT 'Pending'",
+            "created_at": "TEXT",
+            "updated_at": "TEXT"
+        }
+
+        for column, definition in notification_migrations.items():
+            if column not in notification_columns:
+                connection.execute(
+                    f"ALTER TABLE notifications "
+                    f"ADD COLUMN {column} {definition}"
+                )
+
 
 def add_inventory_item(
     batch_id,
@@ -167,10 +232,13 @@ def get_all_inventory():
 
 def get_inventory_by_branch(branch):
     with get_connection() as connection:
-        rows = connection.execute(
-            "SELECT * FROM inventory WHERE branch = ? ORDER BY id DESC",
-            (branch,)
-        ).fetchall()
+        rows = connection.execute("""
+            SELECT *
+            FROM inventory
+            WHERE branch = ?
+            ORDER BY id DESC
+        """, (branch,)).fetchall()
+
         return [dict(row) for row in rows]
 
 
@@ -186,9 +254,12 @@ def add_sales_record(product_name, branch, sale_date, units_sold):
 
 def get_all_sales():
     with get_connection() as connection:
-        rows = connection.execute(
-            "SELECT * FROM sales ORDER BY sale_date DESC"
-        ).fetchall()
+        rows = connection.execute("""
+            SELECT *
+            FROM sales
+            ORDER BY sale_date DESC
+        """).fetchall()
+
         return [dict(row) for row in rows]
 
 
@@ -217,9 +288,12 @@ def create_transfer_request(
 
 def get_all_transfer_requests():
     with get_connection() as connection:
-        rows = connection.execute(
-            "SELECT * FROM transfer_requests ORDER BY id DESC"
-        ).fetchall()
+        rows = connection.execute("""
+            SELECT *
+            FROM transfer_requests
+            ORDER BY id DESC
+        """).fetchall()
+
         return [dict(row) for row in rows]
 
 
@@ -314,6 +388,22 @@ def approve_recovery_decision(
     expected_expired_units,
     admin_username
 ):
+    valid_actions = [
+        "Keep",
+        "Markdown",
+        "Transportation",
+        "Distributor Return"
+    ]
+
+    if action not in valid_actions:
+        raise ValueError("Invalid recovery action")
+
+    if action == "Transportation" and not destination_branch:
+        raise ValueError("Destination branch is required")
+
+    if action == "Transportation" and destination_branch == source_branch:
+        raise ValueError("Destination cannot be the source branch")
+
     with get_connection() as connection:
 
         cursor = connection.execute("""
@@ -370,14 +460,11 @@ def approve_recovery_decision(
                 f"{destination_branch}."
             )
 
-        elif action == "Distributor Return":
+        else:
             message = (
                 f"Prepare {quantity} units of {product_name} "
                 f"from batch {batch_id} for distributor return."
             )
-
-        else:
-            raise ValueError("Invalid recovery action")
 
         connection.execute("""
             INSERT INTO notifications (
@@ -396,7 +483,7 @@ def approve_recovery_decision(
             message
         ))
 
-        if action == "Transportation" and destination_branch:
+        if action == "Transportation":
             destination_message = (
                 f"Incoming stock notification: {quantity} units "
                 f"of {product_name}, batch {batch_id}, "
